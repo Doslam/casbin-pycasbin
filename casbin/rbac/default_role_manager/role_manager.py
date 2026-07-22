@@ -15,6 +15,7 @@
 import logging
 from collections import namedtuple
 from enum import Enum
+from functools import lru_cache
 
 from casbin.rbac import RoleManager as RM
 from casbin.rbac import ConditionalRoleManager as CRM
@@ -103,6 +104,8 @@ class RoleManager(RM):
         self.domain_matching_func = None
         self.all_links = list()
         self.all_roles = dict()
+        self._g_cache_enabled = True
+        self._g_cache = lru_cache(maxsize=None)(self._g_cached_has_link)
 
     def _rebuild(self):
         self.all_roles = dict()
@@ -146,11 +149,26 @@ class RoleManager(RM):
     def add_domain_matching_func(self, fn=None):
         self.domain_matching_func = fn
 
+    def clear_g_cache(self):
+        self._g_cache.cache_clear()
+
+    def enable_g_cache(self, enabled):
+        self._g_cache_enabled = enabled
+        if not enabled:
+            self.clear_g_cache()
+
+    def _g_cached_has_link(self, name1, name2, domain):
+        user = self._get_role(name1)
+        role = self._get_role(name2)
+        return self._has_link(name2, [user], self.max_hierarchy_level)
+
     def clear(self):
+        self.clear_g_cache()
         self.all_roles = dict()
         self.all_links = list()
 
     def add_link(self, name1, name2, *domain):
+        self.clear_g_cache()
         self.all_links.append(Link(name1, name2))
 
         user = self._get_role(name1)
@@ -168,6 +186,7 @@ class RoleManager(RM):
     def delete_link(self, name1, name2, *domain):
         if Link(name1, name2) not in self.all_links:
             return
+        self.clear_g_cache()
         self.all_links.remove(Link(name1, name2))
 
         user = self._get_role(name1)
@@ -181,6 +200,10 @@ class RoleManager(RM):
                 role.remove_role(r)
 
     def has_link(self, name1, name2, *domain):
+        if self._g_cache_enabled:
+            d = domain[0] if domain else None
+            return self._g_cache(name1, name2, d)
+
         user = self._get_role(name1)
         role = self._get_role(name2)
 
@@ -226,12 +249,19 @@ class DomainManagerBase(RM):
         self.matching_func = None
         self.domain_matching_func = None
         self.matching_func = lambda name1, name2: name1 == name2
+        self._g_cache_enabled = True
 
     def add_matching_func(self, fn):
         self.matching_func = fn
 
     def add_domain_matching_func(self, fn=None):
         self.domain_matching_func = fn
+
+    def enable_g_cache(self, enabled):
+        self._g_cache_enabled = enabled
+
+    def clear_g_cache(self):
+        pass
 
     def _get_domain(self, *domain):
         if len(domain) > 1:
@@ -303,10 +333,17 @@ class DomainManager(DomainManagerBase):
     def _rebuild(self):
         self.rm_map = dict()
 
+    def enable_g_cache(self, enabled):
+        super().enable_g_cache(enabled)
+        for rm in self.rm_map.values():
+            rm.enable_g_cache(enabled)
+
     def _get_role_manager(self, *domain):
         domain1 = self._get_domain(*domain)
         if domain1 not in self.rm_map:
-            self.rm_map[domain1] = super()._get_role_manager(*domain)
+            rm = super()._get_role_manager(*domain)
+            rm._g_cache_enabled = self._g_cache_enabled
+            self.rm_map[domain1] = rm
 
         return self.rm_map[domain1]
 
@@ -370,8 +407,29 @@ def match_error_handler(fn, key1, key2):
 
 
 class ConditionalRoleManager(RoleManager, CRM):
+    def __init__(self, max_hierarchy_level=10):
+        super().__init__(max_hierarchy_level)
+        self._g_cache_cond = lru_cache(maxsize=None)(self._g_cached_cond_has_link)
+
+    def clear_g_cache(self):
+        super().clear_g_cache()
+        self._g_cache_cond.cache_clear()
+
+    def _g_cached_cond_has_link(self, name1, name2, domain):
+        if name1 == name2 or (self.matching_func is not None and self._matching_fn(name1, name2)):
+            return True
+        user = self._get_role(name1)
+        role = self._get_role(name2)
+        if domain is None:
+            return self._has_link(role.name, [user], self.max_hierarchy_level)
+        return self._has_link(role.name, [user], self.max_hierarchy_level, domain)
+
     def has_link(self, name1, name2, *domains):
         """determines whether role: name1 inherits role: name2."""
+        if self._g_cache_enabled:
+            d = domains[0] if domains else None
+            return self._g_cache_cond(name1, name2, d)
+
         if name1 == name2 or (self.matching_func is not None and self._matching_fn(name1, name2)):
             return True
 
@@ -481,6 +539,7 @@ class ConditionalDomainManager(DomainManager, ConditionalRoleManager):
 
         if rm is None:
             rm = ConditionalRoleManager(max_hierarchy_level=self.max_hierarchy_level)
+            rm._g_cache_enabled = self._g_cache_enabled
             if store:
                 self.rm_map[domain1] = rm
             if self.domain_matching_func is not None:

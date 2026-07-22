@@ -313,6 +313,13 @@ class CoreEnforcer:
         """controls whether to save a policy rule automatically notify the watcher when it is added or removed."""
         self.auto_notify_watcher = auto_notify_watcher
 
+    def enable_g_function_cache(self, enabled):
+        """controls whether to cache g() function results."""
+        for rm in self.rm_map.values():
+            rm.enable_g_cache(enabled)
+        for crm in self.cond_rm_map.values():
+            crm.enable_g_cache(enabled)
+
     def build_role_links(self):
         """manually rebuild the role inheritance relations."""
 
